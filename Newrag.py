@@ -1,40 +1,188 @@
-# rag_ollama_multimodal.py
 """
-BEST MULTIMODAL RAG PIPELINE:
- - Embeddings: ColNomic/ColNomic-embed-multimodal-7B (HuggingFace)
- - LLM + Vision: LLaVA-34B (Ollama)
- - Parser: RAG-Anything (MinerU)
- - Retrieval: FAISS (inner-product)
+Multimodal RAG (raganything==1.2.8)
+Embeddings: SigLIP SO400M (HuggingFace)
+LLM+Vision: LLaVA-34B via Ollama
 """
 
 import os
 import asyncio
-import uuid
-from pathlib import Path
-from typing import List, Dict, Optional
-
 import torch
 import numpy as np
 import faiss
+from pathlib import Path
+from typing import List, Dict
+
+# HF Embedding Model
 from transformers import AutoProcessor, AutoModel
 
-# RAG-Anything + LightRAG
+# RAG-Anything
 from raganything import RAGAnything, RAGAnythingConfig
+
+# Ollama LLaVA wrapper
 from lightrag.llm.openai import openai_complete_if_cache
 
-# -----------------------------
+
+# -------------------------------------------------------------
 # CONFIG
-# -----------------------------
+# -------------------------------------------------------------
+HF_EMBED_MODEL = "google/siglip-so400m-patch14-384"  # PUBLIC, NO TOKEN NEEDED
 OLLAMA_BASE = "http://localhost:11434/v1"
-LLM_MODEL = "llava:34b"          # used for BOTH text + vision
-
-HF_EMBED_MODEL = "ColNomic/ColNomic-embed-multimodal-7B"  # BEST EMBEDDING MODEL
-
+LLM_MODEL = "llava:34b"
 DOCS_DIR = "./docs"
 WORK_DIR = "./rag_storage_ollama"
 
 
-# -----------------------------
+# -------------------------------------------------------------
+# LOAD SIGLIP EMBEDDING MODEL
+# -------------------------------------------------------------
+print(f"[INFO] Loading embedding model: {HF_EMBED_MODEL}")
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+processor = AutoProcessor.from_pretrained(HF_EMBED_MODEL)
+embed_model = AutoModel.from_pretrained(HF_EMBED_MODEL).to(device)
+embed_model.eval()
+
+# Determine embedding dimension
+with torch.no_grad():
+    test = processor(text="hello", return_tensors="pt").to(device)
+    vec = embed_model.get_text_features(**test)
+    EMBED_DIM = vec.shape[-1]
+
+print(f"[INFO] Embedding dimension = {EMBED_DIM}")
+
+
+# -------------------------------------------------------------
+# EMBEDDING FUNCTION
+# -------------------------------------------------------------
+def embed_text(texts: List[str]):
+    with torch.no_grad():
+        batch = processor(text=texts, return_tensors="pt", padding=True, truncation=True).to(device)
+        emb = embed_model.get_text_features(**batch)
+        emb = emb / emb.norm(dim=-1, keepdim=True)  # normalize
+        return emb.cpu().numpy().astype("float32")
+
+
+# -------------------------------------------------------------
+# FAISS INDEX
+# -------------------------------------------------------------
+index = faiss.IndexFlatIP(EMBED_DIM)  # inner product (cosine)
+chunk_store: List[Dict] = []
+
+
+def add_chunks(chunks: List[Dict]):
+    for c in chunks:
+        emb = embed_text([c["text"]])[0]
+        index.add(np.array([emb]))
+        chunk_store.append(c)
+
+
+def search(query: str, k=5):
+    q_emb = embed_text([query])
+    scores, idxs = index.search(q_emb, k)
+    results = []
+    for sc, ix in zip(scores[0], idxs[0]):
+        if ix == -1:
+            continue
+        c = chunk_store[ix]
+        c["score"] = float(sc)
+        results.append(c)
+    return results
+
+
+# -------------------------------------------------------------
+# OLLAMA LLaVA WRAPPER
+# -------------------------------------------------------------
+async def run_llava(prompt: str):
+    return await openai_complete_if_cache(
+        model=LLM_MODEL,
+        prompt=prompt,
+        base_url=OLLAMA_BASE,
+        api_key="ollama",
+        temperature=0.1
+    )
+
+
+# -------------------------------------------------------------
+# RAG-ANYTHING PARSING (v1.2.8 compatible)
+# -------------------------------------------------------------
+rag_cfg = RAGAnythingConfig(
+    working_dir=WORK_DIR,
+    parser="mineru",
+    parse_method="auto",
+    enable_image_processing=True,
+    enable_table_processing=True,
+    enable_equation_processing=True,
+)
+
+rag = RAGAnything(config=rag_cfg)
+
+
+async def ingest_docs():
+    print("[INFO] Ingesting docs...")
+
+    for f in Path(DOCS_DIR).rglob("*"):
+        if f.suffix.lower() in {".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}:
+            print(f"[INFO] Parsing: {f}")
+
+            # v1.2.8 → use process_document_complete
+            result = await rag.process_document_complete(
+                file_path=str(f),
+                parse_method="auto",
+                display_stats=False
+            )
+
+            chunks = result.get("chunks", [])
+            add_chunks(chunks)
+
+    print("[INFO] Document ingestion completed.\n")
+
+
+# -------------------------------------------------------------
+# RAG QUERY
+# -------------------------------------------------------------
+async def rag_query(q: str):
+    retrieved = search(q, k=6)
+
+    ctx = ""
+    for r in retrieved:
+        ctx += f"\n[score={r['score']:.4f}] {r['text']}\n"
+
+    prompt = f"""
+You are LLaVA-34B, a multimodal reasoning model.
+
+Use the following retrieved context:
+
+--- CONTEXT ---
+{ctx}
+--- END CONTEXT ---
+
+User query: {q}
+
+Give the best answer with maximum accuracy.
+"""
+
+    return await run_llava(prompt)
+
+
+# -------------------------------------------------------------
+# MAIN LOOP
+# -------------------------------------------------------------
+async def main():
+    print("=== MULTIMODAL RAG STARTED (SigLIP + LLaVA-34B) ===")
+
+    await ingest_docs()
+
+    while True:
+        q = input("\nYou: ")
+        if q.lower() in {"exit", "quit"}:
+            break
+        ans = await rag_query(q)
+        print("\nAssistant:", ans)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())# -----------------------------
 # LOAD COLNOMIC MULTIMODAL EMBEDDING
 # -----------------------------
 print(f"\n[INFO] Loading ColNomic Multimodal Embedding Model: {HF_EMBED_MODEL}")
