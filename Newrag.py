@@ -1,495 +1,416 @@
 """
-FINAL MULTIMODAL RAG PIPELINE (Stable + Compatible)
-- raganything==1.2.8
-- SigLIP SO400M embeddings (public)
-- LLaVA-34B via Ollama for responses
+Final multimodal RAGAnything + Ollama (LLaVA-34B)
+ - Uses local Ollama /api/chat for text+vision (llava:34b)
+ - Uses local Ollama /api/embeddings for embeddings (nomic-embed-text -> 768 dims)
+ - Uses RAGAnything for parsing and indexing
+ - Renders PDF pages to images (PyMuPDF) and inserts visual chunks
+ - Insert image captions (via LLaVA) into the index for better retrieval
+
+Adjust environment variables below or export them before running.
 """
 
 import os
 import asyncio
-import torch
-import numpy as np
-import faiss
+import base64
+import json
+import uuid
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Optional, Dict
+from io import BytesIO
 
-# HuggingFace embedding model
-from transformers import AutoProcessor, AutoModel
+import httpx
+import fitz  # PyMuPDF
+from PIL import Image
 
-# RAGAnything v1.2.8
-from raganything import RAGAnything, RAGAnythingConfig
+# RAGAnything / LightRAG imports
+try:
+    from raganything import RAGAnything, RAGAnythingConfig
+    from lightrag.utils import EmbeddingFunc
+except Exception as e:
+    print("Missing required packages. Install with:")
+    print("pip install raganything==0.1.31 lightrag==0.4.2 python-dotenv httpx pymupdf pillow aiofiles")
+    raise
 
-# Ollama LLaVA wrapper (OpenAI-compatible)
-from lightrag.llm.openai import openai_complete_if_cache
+# -------------------------
+# Environment / Defaults
+# -------------------------
+os.environ.setdefault("LLM_BINDING_HOST", "http://localhost:11434")
+os.environ.setdefault("TEXT_VISION_MODEL", "llava:34b")
+os.environ.setdefault("EMBED_MODEL", "nomic-embed-text:latest")  # nomic via Ollama -> 768 dims
+os.environ.setdefault("WORKING_DIR", "./rag_storage")
+os.environ.setdefault("DOCS_DIR", "./docs")
+os.environ.setdefault("MAX_CONCURRENT_FILES", "3")
+os.environ.setdefault("LLAVA_PAGE_CAPTION", "true")  # if "false", skip immediate LLaVA captioning (faster)
 
+OLLAMA_BASE = os.getenv("LLM_BINDING_HOST").rstrip("/")
+TEXT_VISION_MODEL = os.getenv("TEXT_VISION_MODEL")
+EMBED_MODEL = os.getenv("EMBED_MODEL")
+WORKING_DIR = os.getenv("WORKING_DIR")
+DOCS_DIR = os.getenv("DOCS_DIR")
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_FILES", "3"))
+DO_PAGE_CAPTION = os.getenv("LLAVA_PAGE_CAPTION", "true").lower() in ("1", "true", "yes")
 
-# -----------------------------------------------------
-# CONFIG
-# -----------------------------------------------------
-HF_EMBED_MODEL = "google/siglip-so400m-patch14-384"  # BEST public multimodal embedder
-OLLAMA_BASE = "http://localhost:11434/v1"
-LLM_MODEL = "llava:34b"
-DOCS_DIR = "./docs"
-WORK_DIR = "./rag_storage_ollama"
-
-
-print("\n[INIT] Loading SigLIP embeddings:", HF_EMBED_MODEL)
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-# -----------------------------------------------------
-# LOAD SIGLIP MODEL
-# -----------------------------------------------------
-processor = AutoProcessor.from_pretrained(HF_EMBED_MODEL)
-embed_model = AutoModel.from_pretrained(HF_EMBED_MODEL).to(device)
-embed_model.eval()
-
-# Determine real embedding dimension
-with torch.no_grad():
-    t = processor(text="hello", return_tensors="pt").to(device)
-    e = embed_model.get_text_features(**t)
-    EMBED_DIM = e.shape[-1]
-
-print(f"[INIT] Embedding dimension = {EMBED_DIM}")
-
-
-# -----------------------------------------------------
-# EMBEDDING FUNCTION
-# -----------------------------------------------------
-def embed_text(texts: List[str]):
-    with torch.no_grad():
-        batch = processor(
-            text=texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True
-        ).to(device)
-
-        vecs = embed_model.get_text_features(**batch)
-        vecs = vecs / vecs.norm(dim=-1, keepdim=True)
-        return vecs.cpu().numpy().astype("float32")
+# -------------------------
+# Utilities
+# -------------------------
+def uuid4_short() -> str:
+    """Short uuid for doc ids"""
+    return uuid.uuid4().hex[:12]
 
 
-# -----------------------------------------------------
-# FAISS INDEX + STORE
-# -----------------------------------------------------
-index = faiss.IndexFlatIP(EMBED_DIM)
-chunk_store: List[Dict] = []
+def pil_image_to_jpeg_b64(img: Image.Image, quality: int = 85) -> str:
+    """Convert PIL Image to base64 JPEG string (no data URI prefix)."""
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def add_chunks(chunks: List[Dict]):
-    for c in chunks:
-        emb = embed_text([c["text"]])[0]
-        index.add(np.array([emb]))
-        chunk_store.append(c)
+# -------------------------
+# LLaVA / Ollama chat helper (supports images)
+# -------------------------
+class LLMHelper:
+    def __init__(self, model: str = TEXT_VISION_MODEL, base_url: str = OLLAMA_BASE, temperature: float = 0.0, num_ctx: int = 4096):
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.temperature = float(temperature)
+        self.num_ctx = int(num_ctx)
+        self.chat_url = f"{self.base_url}/api/chat"
+
+    async def generate_response(self, prompt: str, system_prompt: Optional[str] = None, images_base64: Optional[List[str]] = None, timeout: Optional[float] = None) -> str:
+        """
+        Send a chat request to Ollama. Images if provided should be base64 JPEG strings (without data: prefix).
+        This uses streaming to be robust with larger responses, but falls back to full-body parse.
+        """
+        payload = {
+            "model": self.model,
+            "messages": [],
+            "options": {
+                "temperature": self.temperature,
+                "num_ctx": self.num_ctx
+            }
+        }
+
+        if system_prompt:
+            payload["messages"].append({"role": "system", "content": system_prompt})
+
+        # Build user message; if images present attach "images" field
+        user_msg = {"role": "user", "content": prompt}
+        if images_base64:
+            # Ollama accepts images as data URIs in `images` field
+            user_msg["images"] = [f"data:image/jpeg;base64,{b}" for b in images_base64]
+
+        payload["messages"].append(user_msg)
+
+        # Use streaming request via httpx
+        async with httpx.AsyncClient(timeout=None) as client:
+            try:
+                async with client.stream("POST", self.chat_url, json=payload, timeout=timeout) as resp:
+                    resp.raise_for_status()
+                    text_out = ""
+                    async for raw_line in resp.aiter_lines():
+                        if not raw_line:
+                            continue
+                        # Ollama streaming often emits JSON lines. Try parse.
+                        try:
+                            j = json.loads(raw_line)
+                        except json.JSONDecodeError:
+                            # Append raw if not JSON
+                            text_out += raw_line
+                            continue
+
+                        # Try common patterns for chat stream chunks
+                        # Possible shapes: {"message": {"content": "..."}} or {"choices": [{"message": {"content": "..."}}]}
+                        content_piece = ""
+                        if isinstance(j, dict):
+                            if "message" in j and isinstance(j["message"], dict):
+                                # message.content could be string or dict
+                                m = j["message"].get("content")
+                                if isinstance(m, str):
+                                    content_piece = m
+                                elif isinstance(m, dict):
+                                    # nested content
+                                    content_piece = m.get("text") or m.get("content") or ""
+                            elif "choices" in j and isinstance(j["choices"], list) and j["choices"]:
+                                ch = j["choices"][0]
+                                if isinstance(ch, dict):
+                                    cm = ch.get("message") or ch.get("delta")
+                                    if isinstance(cm, dict):
+                                        content_piece = cm.get("content") or cm.get("text") or ""
+                            else:
+                                # fallback: try to stringify
+                                content_piece = j.get("content") or j.get("text") or ""
+                        if content_piece:
+                            text_out += content_piece
+                    return text_out.strip()
+            except Exception as exc:
+                # Last-resort: try non-streaming full response
+                try:
+                    r = await client.post(self.chat_url, json=payload, timeout=60)
+                    r.raise_for_status()
+                    jr = r.json()
+                    # Try common shapes
+                    if isinstance(jr, dict):
+                        if "message" in jr and isinstance(jr["message"], dict):
+                            cont = jr["message"].get("content")
+                            return cont if isinstance(cont, str) else json.dumps(cont)
+                        if "choices" in jr and isinstance(jr["choices"], list) and jr["choices"]:
+                            ch = jr["choices"][0]
+                            cont = ch.get("message", {}).get("content") or ch.get("text")
+                            return cont if isinstance(cont, str) else json.dumps(cont)
+                    return str(jr)
+                except Exception as exc2:
+                    raise RuntimeError(f"Ollama chat failed (stream err={exc}, fallback err={exc2})")
 
 
-def search_chunks(query: str, k=6):
-    q_emb = embed_text([query])
-    scores, idxs = index.search(q_emb, k)
+# -------------------------
+# Embeddings: batch via Ollama /api/embeddings
+# -------------------------
+async def ollama_embeddings_batch(texts: List[str], model: str = EMBED_MODEL, base_url: str = OLLAMA_BASE) -> List[List[float]]:
+    """
+    Calls Ollama embeddings endpoint in batch.
+    Expected payloads vary across Ollama versions; this handles common shapes.
+    """
+    url = f"{base_url}/api/embeddings"
+    payload = {"model": model, "input": texts}
 
-    results = []
-    for sc, ix in zip(scores[0], idxs[0]):
-        if ix < 0:
-            continue
-        entry = chunk_store[ix]
-        entry["score"] = float(sc)
-        results.append(entry)
+    async with httpx.AsyncClient(timeout=None) as client:
+        r = await client.post(url, json=payload)
+        r.raise_for_status()
+        resp = r.json()
 
-    return results
-
-
-# -----------------------------------------------------
-# LLaVA CALL (Ollama)
-# -----------------------------------------------------
-async def llava_answer(prompt: str) -> str:
-    return await openai_complete_if_cache(
-        model=LLM_MODEL,
-        prompt=prompt,
-        base_url=OLLAMA_BASE,
-        api_key="ollama",
-        temperature=0.1
-    )
-
-
-# -----------------------------------------------------
-# RAGANYTHING PARSER (SAFE FOR v1.2.8)
-# -----------------------------------------------------
-rag_cfg = RAGAnythingConfig(
-    working_dir=WORK_DIR,
-    parser="mineru",
-    parse_method="auto",
-    enable_image_processing=True,
-    enable_table_processing=True,
-    enable_equation_processing=True,
-)
-
-rag = RAGAnything(config=rag_cfg)
+    # Parse common response shapes:
+    # - {"data":[{"embedding":[...]} , ...]}
+    # - {"embedding": [...]} (single)
+    # - [{"embedding":[...]} , ...]
+    if isinstance(resp, dict):
+        if "data" in resp and isinstance(resp["data"], list):
+            return [item.get("embedding") for item in resp["data"]]
+        if "embedding" in resp:
+            return [resp["embedding"]]
+    if isinstance(resp, list):
+        # list of embeddings or list of objects with embedding
+        if all(isinstance(x, dict) and "embedding" in x for x in resp):
+            return [x["embedding"] for x in resp]
+        # maybe raw vectors list
+        return resp
+    raise ValueError(f"Unknown embedding response shape: {resp}")
 
 
-async def ingest_documents():
-    print("\n[INFO] Starting document ingestion...")
+def embedding_func_factory() -> EmbeddingFunc:
+    # nomic-embed-text via Ollama uses 768 dims
+    return EmbeddingFunc(embedding_dim=768, max_token_size=8192, func=ollama_embeddings_batch)
 
-    valid_ext = {".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}
 
-    for f in Path(DOCS_DIR).rglob("*"):
-        if f.suffix.lower() not in valid_ext:
-            continue
+# -------------------------
+# PDF page rendering to images
+# -------------------------
+def render_pdf_pages_to_images_b64(pdf_path: str, zoom: float = 2.0, max_pages: Optional[int] = None) -> List[str]:
+    """
+    Render PDF pages using PyMuPDF and return list of base64-encoded JPEG strings (no data: prefix).
+    zoom: scaling factor for page rendering (2.0 gives higher-res)
+    max_pages: optionally limit pages rendered
+    """
+    img_b64_list: List[str] = []
+    doc = fitz.open(pdf_path)
+    try:
+        pages = range(len(doc))
+        if max_pages is not None:
+            pages = range(min(len(doc), max_pages))
+        for i in pages:
+            page = doc.load_page(i)
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img_bytes = pix.tobytes("jpeg")
+            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+            img_b64_list.append(img_b64)
+    finally:
+        doc.close()
+    return img_b64_list
 
-        print(f"[INGEST] Parsing: {f}")
 
+# -------------------------
+# The main RAG wrapper class
+# -------------------------
+class OllamaRAGMultimodal:
+    def __init__(self, docs_dir: str = DOCS_DIR, working_dir: str = WORKING_DIR, do_page_caption: bool = DO_PAGE_CAPTION):
+        self.docs_dir = Path(docs_dir)
+        self.working_dir = str(working_dir)
+        self.do_page_caption = do_page_caption
+
+        # RAG config
+        self.config = RAGAnythingConfig(
+            working_dir=self.working_dir,
+            parser="mineru",
+            parse_method="auto",
+            enable_image_processing=True,
+            enable_table_processing=True,
+            enable_equation_processing=True,
+        )
+
+        self.rag: Optional[RAGAnything] = None
+        self.llm = LLMHelper(model=TEXT_VISION_MODEL, base_url=OLLAMA_BASE, temperature=0.0, num_ctx=4096)
+
+    async def initialize(self):
+        print("[RAG] Initializing RAGAnything with Ollama adapters...")
+        self.rag = RAGAnything(
+            config=self.config,
+            llm_model_func=self._text_adapter,
+            vision_model_func=self._vision_adapter,
+            embedding_func=embedding_func_factory()
+        )
+        # no-op hook to avoid duplicate multimodal marking in some RAGAnything versions
+        async def _noop(*a, **k): return None
+        self.rag._mark_multimodal_processing_complete = _noop
+        print("[RAG] Initialized.")
+
+    # adapter for text-only calls
+    async def _text_adapter(self, prompt: str, system_prompt: Optional[str] = None, history_messages: Optional[List[Dict]] = None, **kwargs):
+        return await self.llm.generate_response(prompt=prompt, system_prompt=(system_prompt or ""))
+
+    # adapter for vision calls (RAGAnything will use this to ask about images)
+    async def _vision_adapter(self, prompt: str, system_prompt: Optional[str] = None, image_base64: Optional[str] = None, messages: Optional[List[Dict]] = None, **kwargs):
+        # If a single image_base64 provided, forward it; if messages provided, fall back to constructing request similarly
+        if image_base64:
+            return await self.llm.generate_response(prompt=prompt, system_prompt=(system_prompt or ""), images_base64=[image_base64])
+        # messages fallback (pass-through not implemented in detail here)
+        return await self.llm.generate_response(prompt=prompt, system_prompt=(system_prompt or ""))
+
+    async def process_single_file(self, file_path: Path):
+        print(f"[INGEST] Processing: {file_path}")
         try:
-            result = await rag.process_document_complete(
-                file_path=str(f),
+            # 1) Let RAGAnything parse text/tables/slides via mineru
+            await self.rag.process_document_complete(
+                file_path=str(file_path),
+                output_dir=os.path.join(self.working_dir, "output"),
                 parse_method="auto",
-                display_stats=False
+                display_stats=True
             )
+
+            # 2) For PDFs: render pages -> insert image chunks + optional captions
+            suffix = file_path.suffix.lower()
+            if suffix == ".pdf":
+                print(f"[INGEST] Rendering PDF pages for: {file_path.name}")
+                try:
+                    images_b64 = render_pdf_pages_to_images_b64(str(file_path), zoom=1.5)
+                except Exception as e:
+                    print(f"[ERROR] PDF rendering failed for {file_path}: {e}")
+                    images_b64 = []
+
+                if images_b64:
+                    content_list = []
+                    for idx, img_b64 in enumerate(images_b64):
+                        # Add image chunk
+                        content_list.append({
+                            "type": "image",
+                            "text": f"{file_path.name} - page {idx+1}",
+                            "image_base64": img_b64,
+                            "page_idx": idx
+                        })
+
+                        # Optionally caption page using LLaVA to improve searchability
+                        if self.do_page_caption:
+                            try:
+                                caption = await self._vision_adapter(
+                                    prompt="Provide a short caption (1-2 lines) describing the main content of the page and list any charts/tables present.",
+                                    system_prompt="You are a helpful document vision assistant. Keep captions concise.",
+                                    image_base64=img_b64
+                                )
+                            except Exception as e:
+                                caption = f"[captioning failed: {e}]"
+                            content_list.append({
+                                "type": "text",
+                                "text": caption or f"Page {idx+1} of {file_path.name}",
+                                "page_idx": idx
+                            })
+
+                    if content_list:
+                        doc_id = f"{file_path.stem}-pages-{uuid4_short()}"
+                        await self.rag.insert_content_list(
+                            content_list=content_list,
+                            file_path=str(file_path),
+                            doc_id=doc_id,
+                            display_stats=True
+                        )
+                        print(f"[INGEST] Inserted {len(content_list)} visual/text chunks for {file_path.name}")
+
+            # 3) For image files (jpg/png etc.) -> insert and caption
+            elif suffix in {".png", ".jpg", ".jpeg", ".tiff", ".webp"}:
+                with open(file_path, "rb") as fh:
+                    b64 = base64.b64encode(fh.read()).decode("utf-8")
+                caption = None
+                if self.do_page_caption:
+                    try:
+                        caption = await self._vision_adapter(
+                            prompt="Provide a short caption and list any notable items (tables, charts, text) in this image.",
+                            system_prompt="You are a helpful vision assistant. Be concise.",
+                            image_base64=b64
+                        )
+                    except Exception as e:
+                        caption = f"[caption error: {e}]"
+
+                content_list = [
+                    {"type": "image", "text": file_path.name, "image_base64": b64},
+                    {"type": "text", "text": caption or f"Image: {file_path.name}"}
+                ]
+                await self.rag.insert_content_list(content_list=content_list, file_path=str(file_path), doc_id=f"{file_path.stem}-img-{uuid4_short()}")
+                print(f"[INGEST] Inserted image chunks for {file_path.name}")
+
+            # 4) For other types (docx, pptx, xlsx, txt, md) the mineru parse covered them.
         except Exception as e:
-            print(f"[ERROR] Failed to parse {f}: {e}")
-            continue
+            print(f"[ERROR] ingesting {file_path}: {e}")
 
-        # SAFETY: skip if mineru returned nothing
-        if result is None or "chunks" not in result:
-            print(f"[WARN] No chunks extracted from {f}")
-            continue
+    async def process_folder(self, folder: Optional[str] = None):
+        folder = Path(folder or self.docs_dir)
+        supported_suffixes = {
+            ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls",
+            ".png", ".jpg", ".jpeg", ".tiff", ".webp", ".txt", ".md"
+        }
+        files = [p for p in folder.rglob("*") if p.suffix.lower() in supported_suffixes]
 
-        chunks = result["chunks"]
-        add_chunks(chunks)
+        if not files:
+            print("[INGEST] No supported files found.")
+            return
 
-    print("\n[INFO] Ingestion complete. Total chunks:", len(chunk_store))
+        print(f"[INGEST] Found {len(files)} files. Ingesting with concurrency={MAX_CONCURRENT} ...")
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
 
+        async def worker(p: Path):
+            async with sem:
+                await self.process_single_file(p)
 
-# -----------------------------------------------------
-# RAG QUERY PIPELINE
-# -----------------------------------------------------
-async def answer_query(q: str) -> str:
-    retrieved = search_chunks(q, k=6)
+        await asyncio.gather(*(worker(f) for f in files))
+        print("[INGEST] Folder ingestion complete.")
 
-    context = ""
-    for r in retrieved:
-        context += f"[score={r['score']:.4f}] {r['text']}\n"
-
-    prompt = f"""
-You are LLaVA-34B, a highly intelligent multimodal reasoner.
-
-Use the following retrieved knowledge:
-
---- CONTEXT ---
-{context}
---- END ---
-
-User query: {q}
-
-Provide the most accurate answer.
-"""
-
-    return await llava_answer(prompt)
+    async def query(self, q: str, mode: str = "hybrid"):
+        print(f"[QUERY] {q}")
+        res = await self.rag.aquery(q, mode=mode)
+        return res
 
 
-# -----------------------------------------------------
-# MAIN LOOP
-# -----------------------------------------------------
+# -------------------------
+# Main
+# -------------------------
 async def main():
-    print("\n=== SigLIP + LLaVA-34B Multimodal RAG Started ===")
-
-    await ingest_documents()
-
-    while True:
-        q = input("\nYou: ").strip()
-        if q.lower() in {"exit", "quit"}:
-            break
-
-        ans = await answer_query(q)
-        print("\nAssistant:", ans)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())# -------------------------------------------------------------
-print(f"[INFO] Loading embedding model: {HF_EMBED_MODEL}")
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-processor = AutoProcessor.from_pretrained(HF_EMBED_MODEL)
-embed_model = AutoModel.from_pretrained(HF_EMBED_MODEL).to(device)
-embed_model.eval()
-
-# Determine embedding dimension
-with torch.no_grad():
-    test = processor(text="hello", return_tensors="pt").to(device)
-    vec = embed_model.get_text_features(**test)
-    EMBED_DIM = vec.shape[-1]
-
-print(f"[INFO] Embedding dimension = {EMBED_DIM}")
-
-
-# -------------------------------------------------------------
-# EMBEDDING FUNCTION
-# -------------------------------------------------------------
-def embed_text(texts: List[str]):
-    with torch.no_grad():
-        batch = processor(text=texts, return_tensors="pt", padding=True, truncation=True).to(device)
-        emb = embed_model.get_text_features(**batch)
-        emb = emb / emb.norm(dim=-1, keepdim=True)  # normalize
-        return emb.cpu().numpy().astype("float32")
-
-
-# -------------------------------------------------------------
-# FAISS INDEX
-# -------------------------------------------------------------
-index = faiss.IndexFlatIP(EMBED_DIM)  # inner product (cosine)
-chunk_store: List[Dict] = []
-
-
-def add_chunks(chunks: List[Dict]):
-    for c in chunks:
-        emb = embed_text([c["text"]])[0]
-        index.add(np.array([emb]))
-        chunk_store.append(c)
-
-
-def search(query: str, k=5):
-    q_emb = embed_text([query])
-    scores, idxs = index.search(q_emb, k)
-    results = []
-    for sc, ix in zip(scores[0], idxs[0]):
-        if ix == -1:
-            continue
-        c = chunk_store[ix]
-        c["score"] = float(sc)
-        results.append(c)
-    return results
-
-
-# -------------------------------------------------------------
-# OLLAMA LLaVA WRAPPER
-# -------------------------------------------------------------
-async def run_llava(prompt: str):
-    return await openai_complete_if_cache(
-        model=LLM_MODEL,
-        prompt=prompt,
-        base_url=OLLAMA_BASE,
-        api_key="ollama",
-        temperature=0.1
-    )
-
-
-# -------------------------------------------------------------
-# RAG-ANYTHING PARSING (v1.2.8 compatible)
-# -------------------------------------------------------------
-rag_cfg = RAGAnythingConfig(
-    working_dir=WORK_DIR,
-    parser="mineru",
-    parse_method="auto",
-    enable_image_processing=True,
-    enable_table_processing=True,
-    enable_equation_processing=True,
-)
-
-rag = RAGAnything(config=rag_cfg)
-
-
-async def ingest_docs():
-    print("[INFO] Ingesting docs...")
-
-    for f in Path(DOCS_DIR).rglob("*"):
-        if f.suffix.lower() in {".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}:
-            print(f"[INFO] Parsing: {f}")
-
-            # v1.2.8 → use process_document_complete
-            result = await rag.process_document_complete(
-                file_path=str(f),
-                parse_method="auto",
-                display_stats=False
-            )
-
-            chunks = result.get("chunks", [])
-            add_chunks(chunks)
-
-    print("[INFO] Document ingestion completed.\n")
-
-
-# -------------------------------------------------------------
-# RAG QUERY
-# -------------------------------------------------------------
-async def rag_query(q: str):
-    retrieved = search(q, k=6)
-
-    ctx = ""
-    for r in retrieved:
-        ctx += f"\n[score={r['score']:.4f}] {r['text']}\n"
-
-    prompt = f"""
-You are LLaVA-34B, a multimodal reasoning model.
-
-Use the following retrieved context:
-
---- CONTEXT ---
-{ctx}
---- END CONTEXT ---
-
-User query: {q}
-
-Give the best answer with maximum accuracy.
-"""
-
-    return await run_llava(prompt)
-
-
-# -------------------------------------------------------------
-# MAIN LOOP
-# -------------------------------------------------------------
-async def main():
-    print("=== MULTIMODAL RAG STARTED (SigLIP + LLaVA-34B) ===")
-
-    await ingest_docs()
-
-    while True:
-        q = input("\nYou: ")
-        if q.lower() in {"exit", "quit"}:
-            break
-        ans = await rag_query(q)
-        print("\nAssistant:", ans)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())# -----------------------------
-# LOAD COLNOMIC MULTIMODAL EMBEDDING
-# -----------------------------
-print(f"\n[INFO] Loading ColNomic Multimodal Embedding Model: {HF_EMBED_MODEL}")
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-processor = AutoProcessor.from_pretrained(HF_EMBED_MODEL)
-embed_model = AutoModel.from_pretrained(HF_EMBED_MODEL).to(device)
-embed_model.eval()
-
-# Detect embedding dimension dynamically
-with torch.no_grad():
-    sample = processor(text="hello world", return_tensors="pt").to(device)
-    vec = embed_model.get_text_features(**sample)
-    EMBED_DIM = vec.shape[-1]
-
-print(f"[INFO] Embedding dimension = {EMBED_DIM}\n")
-
-
-def embed_text(texts: List[str]):
-    """Embed text using ColNomic multimodal model."""
-    with torch.no_grad():
-        batch = processor(text=texts, return_tensors="pt", padding=True, truncation=True).to(device)
-        feats = embed_model.get_text_features(**batch)
-        feats = feats / feats.norm(dim=-1, keepdim=True)
-        return feats.cpu().numpy().tolist()
-
-
-# -----------------------------
-# FAISS INDEX
-# -----------------------------
-index = faiss.IndexFlatIP(EMBED_DIM)
-chunk_store: List[Dict] = []
-
-
-def add_to_index(chunks: List[Dict]):
-    for ch in chunks:
-        emb = embed_text([ch["text"]])[0]
-        index.add(np.array([emb], dtype="float32"))
-        chunk_store.append(ch)
-
-
-def search_index(query: str, k: int = 6):
-    q_emb = np.array(embed_text([query]), dtype="float32")
-    scores, idxs = index.search(q_emb, k)
-    results = []
-    for sc, ix in zip(scores[0], idxs[0]):
-        if ix == -1:
-            continue
-        hit = chunk_store[ix]
-        hit = {**hit, "score": float(sc)}
-        results.append(hit)
-    return results
-
-
-# -----------------------------
-# OLLAMA LLaVA-34B WRAPPER
-# -----------------------------
-async def ollama_llava(prompt: str):
-    return await openai_complete_if_cache(
-        model=LLM_MODEL,
-        prompt=prompt,
-        base_url=OLLAMA_BASE,
-        api_key="ollama",
-        temperature=0.1
-    )
-
-
-# -----------------------------
-# RAG-ANYTHING PARSER
-# -----------------------------
-rag_cfg = RAGAnythingConfig(
-    working_dir=WORK_DIR,
-    parser="mineru",
-    parse_method="auto",
-    enable_image_processing=True,
-    enable_table_processing=True,
-    enable_equation_processing=True,
-)
-
-rag = RAGAnything(config=rag_cfg)
-
-
-async def ingest_documents():
-    print("[INFO] Ingesting documents...")
-    for file in Path(DOCS_DIR).rglob("*"):
-        if file.suffix.lower() in {".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}:
-            print(f"[INFO] Parsing: {file}")
-            chunks = await rag.process_document_extract_chunks(str(file))
-            add_to_index(chunks)
-
-    print("[INFO] Document ingestion complete.\n")
-
-
-# -----------------------------
-# MULTIMODAL RAG QUERY
-# -----------------------------
-async def rag_query(q: str):
-    retrieved = search_index(q, k=6)
-
-    context = ""
-    for r in retrieved:
-        context += f"\n[score={r['score']:.4f}] {r['text']}\n"
-
-    prompt = f"""
-You are LLaVA-34B, a multimodal expert model.
-Use the retrieved context below (from text, images, OCR, tables):
-
---- CONTEXT START ---
-{context}
---- CONTEXT END ---
-
-User query:
-{q}
-
-Give a precise, factual, best-quality answer.
-"""
-
-    print("\n[INFO] Sending to LLaVA-34B...")
-    return await ollama_llava(prompt)
-
-
-# -----------------------------
-# MAIN LOOP
-# -----------------------------
-async def main():
-    print("=== ColNomic + LLaVA-34B Multimodal RAG Started ===")
-
-    await ingest_documents()
-
-    while True:
-        q = input("\nYou: ").strip()
-        if q.lower() in ("exit", "quit"):
-            break
-
-        ans = await rag_query(q)
-        print("\nAssistant:", ans)
+    ragm = OllamaRAGMultimodal(docs_dir=DOCS_DIR, working_dir=WORKING_DIR, do_page_caption=DO_PAGE_CAPTION)
+    await ragm.initialize()
+
+    # Ingest all files in the docs folder (change DOCS_DIR env var or pass path)
+    await ragm.process_folder(DOCS_DIR)
+
+    # Example queries
+    q1 = "Summarize quarterly financial highlights across all reports."
+    try:
+        ans1 = await ragm.query(q1)
+        print("\n----- ANSWER 1 -----\n", ans1)
+    except Exception as e:
+        print("Query 1 error:", e)
+
+    q2 = "List pages or images that contain charts or tables and summarize them."
+    try:
+        ans2 = await ragm.query(q2)
+        print("\n----- ANSWER 2 -----\n", ans2)
+    except Exception as e:
+        print("Query 2 error:", e)
 
 
 if __name__ == "__main__":
