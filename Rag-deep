@@ -1,0 +1,279 @@
+import asyncio
+import base64
+import requests
+import json
+import os
+from typing import List, Optional
+from raganything import RAGAnything, RAGAnythingConfig
+from lightrag.utils import EmbeddingFunc
+
+class EnhancedOllamaLocal:
+    def __init__(self, base_url: str = "http://localhost:11434"):
+        self.base_url = base_url
+        self.available_models = self._get_available_models()
+    
+    def _get_available_models(self) -> List[str]:
+        """Get list of available Ollama models"""
+        try:
+            response = requests.get(f"{self.base_url}/api/tags")
+            response.raise_for_status()
+            models = [model["name"] for model in response.json().get("models", [])]
+            print(f"Available Ollama models: {models}")
+            return models
+        except Exception as e:
+            print(f"Warning: Could not fetch available models: {e}")
+            return []
+    
+    def _check_model_available(self, model: str) -> bool:
+        """Check if a specific model is available"""
+        return any(model in available_model for available_model in self.available_models)
+    
+    def text_completion(self, model: str, prompt: str, system_prompt: Optional[str] = None, 
+                       history_messages: List = [], **kwargs):
+        """Enhanced text completion with fallback models"""
+        # Fallback logic if preferred model not available
+        if not self._check_model_available(model):
+            print(f"Model {model} not available. Trying fallbacks...")
+            fallback_models = ["llama3.1:latest", "mistral:latest", "llama2:latest"]
+            for fallback in fallback_models:
+                if self._check_model_available(fallback):
+                    model = fallback
+                    print(f"Using fallback model: {model}")
+                    break
+        
+        messages = []
+        
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        
+        messages.extend(history_messages)
+        messages.append({"role": "user", "content": prompt})
+        
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": kwargs.get("temperature", 0.1),
+                "top_p": kwargs.get("top_p", 0.9),
+                "top_k": kwargs.get("top_k", 40),
+            }
+        }
+        
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/chat",
+                json=payload,
+                timeout=kwargs.get("timeout", 180)
+            )
+            response.raise_for_status()
+            return response.json()["message"]["content"]
+        except requests.exceptions.Timeout:
+            return "Error: Request timeout - model may be loading or too slow"
+        except Exception as e:
+            return f"Error in text completion: {str(e)}"
+    
+    def vision_completion(self, model: str, prompt: str, image_path: Optional[str] = None, 
+                         image_data: Optional[bytes] = None, system_prompt: Optional[str] = None, **kwargs):
+        """Enhanced vision completion with better image handling"""
+        # Fallback for vision models
+        if not self._check_model_available(model):
+            vision_fallbacks = ["llava:latest", "bakllava:latest", "moondream:latest"]
+            for fallback in vision_fallbacks:
+                if self._check_model_available(fallback):
+                    model = fallback
+                    print(f"Using vision fallback model: {model}")
+                    break
+        
+        messages = []
+        
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        
+        content = [{"type": "text", "text": prompt}]
+        
+        # Handle image data
+        if image_data:
+            if isinstance(image_data, str):
+                image_base64 = image_data
+            else:
+                image_base64 = base64.b64encode(image_data).decode('utf-8')
+        elif image_path and os.path.exists(image_path):
+            with open(image_path, "rb") as img_file:
+                image_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+        else:
+            # No image provided, fall back to text
+            return self.text_completion(model, prompt, system_prompt, **kwargs)
+        
+        content.append({
+            "type": "image", 
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": image_base64
+            }
+        })
+        
+        messages.append({"role": "user", "content": content})
+        
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": kwargs.get("temperature", 0.1),
+            }
+        }
+        
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/chat",
+                json=payload,
+                timeout=kwargs.get("timeout", 180)
+            )
+            response.raise_for_status()
+            return response.json()["message"]["content"]
+        except Exception as e:
+            return f"Error in vision completion: {str(e)}"
+    
+    def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Get embeddings with fallback models"""
+        embedding_models = ["nomic-embed-text", "all-minilm"]
+        model = "nomic-embed-text"
+        
+        # Find available embedding model
+        for emb_model in embedding_models:
+            if self._check_model_available(emb_model):
+                model = emb_model
+                break
+        
+        embeddings = []
+        for text in texts:
+            payload = {
+                "model": model,
+                "prompt": text
+            }
+            try:
+                response = requests.post(
+                    f"{self.base_url}/api/embeddings",
+                    json=payload,
+                    timeout=60
+                )
+                response.raise_for_status()
+                embedding = response.json().get("embedding", [])
+                embeddings.append(embedding)
+            except Exception as e:
+                print(f"Embedding error: {e}")
+                # Create simple fallback embedding
+                embeddings.append([0.0] * 768)
+        
+        return embeddings
+
+async def main_enhanced():
+    """Enhanced main function with better configuration"""
+    
+    # Initialize enhanced Ollama client
+    ollama = EnhancedOllamaLocal()
+    
+    config = RAGAnythingConfig(
+        working_dir="./rag_storage_ollama",
+        parser="docling",  # Better for document understanding
+        parse_method="auto",
+        enable_image_processing=True,
+        enable_table_processing=True,
+        enable_equation_processing=True,
+        chunk_size=1024,
+        chunk_overlap=100,
+    )
+
+    # Model functions
+    def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
+        return ollama.text_completion(
+            "llama3.1:latest",  # Preferred model
+            prompt,
+            system_prompt=system_prompt,
+            history_messages=history_messages,
+            **kwargs
+        )
+
+    def vision_model_func(prompt, system_prompt=None, image_data=None, **kwargs):
+        return ollama.vision_completion(
+            "llava:latest",
+            prompt,
+            image_data=image_data,
+            system_prompt=system_prompt,
+            **kwargs
+        )
+
+    # Embedding function
+    def ollama_embedding_func(texts):
+        return ollama.get_embeddings(texts)
+
+    embedding_func = EmbeddingFunc(
+        embedding_dim=768,
+        max_token_size=8192,
+        func=ollama_embedding_func
+    )
+
+    # Initialize RAG
+    rag = RAGAnything(
+        config=config,
+        llm_model_func=llm_model_func,
+        vision_model_func=vision_model_func,
+        embedding_func=embedding_func,
+    )
+
+    # Process documents
+    documents_to_process = [
+        "document.pdf",
+        "presentation.pptx", 
+        "image.png",
+        "data.docx"
+    ]
+    
+    for doc_path in documents_to_process:
+        if os.path.exists(doc_path):
+            print(f"Processing {doc_path}...")
+            await rag.process_document_complete(
+                file_path=doc_path,
+                output_dir="./ollama_output",
+                parse_method="auto"
+            )
+    
+    # Interactive query loop
+    while True:
+        query = input("\nEnter your query (or 'quit' to exit): ")
+        if query.lower() == 'quit':
+            break
+        
+        result = await rag.aquery(query, mode="hybrid")
+        print(f"\nAnswer: {result}")
+
+if __name__ == "__main__":
+    # First, let's check if Ollama is running
+    try:
+        response = requests.get("http://localhost:11434/api/tags", timeout=5)
+        print("Ollama is running! Starting RAGAnything...")
+        asyncio.run(main_enhanced())
+    except:
+        print("""
+⚠️  Ollama is not running or not accessible!
+
+Please start Ollama first:
+1. Download Ollama from: https://ollama.ai
+2. Install and run it
+3. Pull required models:
+
+# For text models
+ollama pull llama3.1:latest
+ollama pull mistral:latest
+
+# For vision models  
+ollama pull llava:latest
+ollama pull bakllava:latest
+
+# For embeddings
+ollama pull nomic-embed-text
+
+Then run this script again.
+        """)
